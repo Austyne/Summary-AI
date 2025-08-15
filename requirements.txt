@@ -1,11 +1,38 @@
-numpy==2.2.5
+# Core ML and AI Libraries
+torch>=2.0.0
+transformers>=4.20.0
+datasets>=2.0.0
+
+# NLP Libraries
 nltk==3.8.1
-requests==2.32.3
-python-dotenv==1.0.1
-scikit-learn==1.5.0
 spacy==3.8.5
+rouge-score>=0.1.2
+
+# Data Processing
+numpy==2.2.5
+pandas>=1.5.0
+
+# Document Processing
+PyPDF2>=3.0.0
+python-docx>=0.8.11
+
+# Web Scraping
+requests==2.32.3
+beautifulsoup4>=4.11.0
+
+# Web Framework
+streamlit>=1.25.0
+
+# Visualization
+plotly>=5.0.0
+
+# Scientific Computing
+scikit-learn==1.5.0
+
+# Utilities
+python-dotenv==1.0.1
+pathlib2>=2.3.0
+
+# Optional: For enhanced performance
 groq==0.28.0
 
-
-https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0.tar.gz
-https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.8.0/en_core_web_lg-3.8.0.tar.gz
