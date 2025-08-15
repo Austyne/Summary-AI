@@ -1,0 +1,11 @@
+numpy==2.2.5
+nltk==3.8.1
+requests==2.32.3
+python-dotenv==1.0.1
+scikit-learn==1.5.0
+spacy==3.8.5
+groq==0.28.0
+
+
+https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0.tar.gz
+https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.8.0/en_core_web_lg-3.8.0.tar.gz
