@@ -1,25 +1,29 @@
 """
-Full BART Document Summarizer - Streamlit App
-============================================
-Complete system with full facebook/bart-large-cnn model
+Full BART Document Summarizer - Streamlit App (Upgraded)
+========================================================
+- Methods: TextRank | BART | RAG + BART | BART + Verifier | RAG + BART + Verifier
+- Factuality check with NLI (DeBERTa MNLI)
+- Optional ROUGE / BERTScore evaluation if reference summary provided
 """
 
-import torch
-import pandas as pd
-import numpy as np
-import re
-import time
+import os, io, re, time, warnings
+from typing import List, Dict, Optional
 from pathlib import Path
-from typing import List, Dict, Optional, Union
-import warnings
+
+import numpy as np
+import pandas as pd
+import torch
 warnings.filterwarnings('ignore')
 
-# Core libraries
-from transformers import BartTokenizer, BartForConditionalGeneration, pipeline
+# ---------- Core / Models ----------
+from transformers import (
+    BartTokenizer, BartForConditionalGeneration, pipeline,
+    AutoTokenizer, AutoModelForSequenceClassification
+)
 from rouge_score import rouge_scorer
-from datasets import load_dataset
+from bert_score import score as bertscore
 
-# Document processing
+# ---------- Document processing ----------
 import PyPDF2
 try:
     from docx import Document
@@ -27,620 +31,589 @@ except ImportError:
     Document = None
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse
 
-# Visualization and UI
+# ---------- Extractive baseline ----------
+try:
+    from sumy.parsers.plaintext import PlainTextParser
+    from sumy.nlp.tokenizers import Tokenizer as SumyTokenizer
+    from sumy.summarizers.textrank import TextRankSummarizer
+    HAS_SUMY = True
+except Exception:
+    HAS_SUMY = False
+
+# ---------- RAG ----------
+try:
+    from sentence_transformers import SentenceTransformer
+    import faiss
+    HAS_ST = True
+except Exception:
+    HAS_ST = False
+
+# ---------- UI ----------
 import streamlit as st
-import plotly.express as px
-import plotly.graph_objects as go
 
-# Streamlit configuration
+# ---------------- Streamlit page config ----------------
 st.set_page_config(
-    page_title="Universal BART Summarizer",
+    page_title="🚀 Universal Summarizer (BART + RAG + Verifier)",
     page_icon="📝",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
+# ======================================================
+#                 Document Processor
+# ======================================================
 class UniversalDocumentProcessor:
-    """Handles all types of document input processing"""
-    
     def __init__(self):
         self.supported_formats = ['.txt', '.pdf', '.docx', '.md']
-        
+
     def read_text_file(self, file_content) -> str:
-        """Read text from uploaded file"""
         try:
             return str(file_content, 'utf-8')
         except UnicodeDecodeError:
             return str(file_content, 'latin-1')
-    
+
     def read_pdf_file(self, file_content) -> str:
-        """Extract text from PDF file content"""
         try:
-            import io
             pdf_file = io.BytesIO(file_content)
             pdf_reader = PyPDF2.PdfReader(pdf_file)
             text = ""
             for page in pdf_reader.pages:
-                text += page.extract_text() + "\n"
+                txt = page.extract_text() or ""
+                text += txt + "\n"
             return text.strip()
         except Exception as e:
             st.error(f"Error reading PDF: {e}")
             return ""
-    
+
     def read_docx_file(self, file_content) -> str:
-        """Extract text from DOCX file content"""
         try:
             if Document is None:
                 st.error("python-docx not installed. Install with: pip install python-docx")
                 return ""
-            
-            import io
             docx_file = io.BytesIO(file_content)
             doc = Document(docx_file)
-            text = ""
-            for paragraph in doc.paragraphs:
-                text += paragraph.text + "\n"
+            text = "\n".join(p.text for p in doc.paragraphs)
             return text.strip()
         except Exception as e:
             st.error(f"Error reading DOCX: {e}")
             return ""
-    
+
     def read_url(self, url: str) -> str:
-        """Extract text from web pages"""
         try:
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            headers = {'User-Agent': 'Mozilla/5.0'}
             response = requests.get(url, headers=headers, timeout=10)
             soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Remove script and style elements
-            for script in soup(["script", "style"]):
-                script.decompose()
-            
-            text = soup.get_text()
-            lines = (line.strip() for line in text.splitlines())
-            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-            text = '\n'.join(chunk for chunk in chunks if chunk)
-            
-            return text
+            for s in soup(["script", "style", "noscript", "header", "footer", "nav"]):
+                s.decompose()
+            text = soup.get_text(separator="\n")
+            lines = (l.strip() for l in text.splitlines())
+            chunks = (p.strip() for l in lines for p in l.split("  "))
+            return "\n".join(c for c in chunks if c)
         except Exception as e:
             st.error(f"Error reading URL: {e}")
             return ""
 
-
-@st.cache_resource
+# ======================================================
+#                 BART Loader + Summarizer
+# ======================================================
+@st.cache_resource(show_spinner=False)
 def load_bart_model():
-    """Load Full BART model with Streamlit caching"""
     model_name = "facebook/bart-large-cnn"
-    print(f"Loading Full BART model: {model_name}")
-    
-    # Load tokenizer and model
-    tokenizer = BartTokenizer.from_pretrained(model_name)
-    model = BartForConditionalGeneration.from_pretrained(model_name)
-    
-    # Move to GPU if available
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model.to(device)
-    
-    # Create pipeline
-    summarizer_pipeline = pipeline(
-        "summarization", 
-        model=model, 
-        tokenizer=tokenizer,
-        device=0 if device == 'cuda' else -1
-    )
-    
-    print(f"Full BART model loaded successfully on {device}")
-    return {
-        'pipeline': summarizer_pipeline,
-        'tokenizer': tokenizer,
-        'model': model,
-        'device': device
-    }
-
+    tok = BartTokenizer.from_pretrained(model_name)
+    mdl = BartForConditionalGeneration.from_pretrained(model_name)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    mdl.to(device)
+    pipe = pipeline("summarization", model=mdl, tokenizer=tok, device=0 if device=="cuda" else -1)
+    return {"pipeline": pipe, "tokenizer": tok, "model": mdl, "device": device}
 
 class SmartBARTSummarizer:
-    """Advanced BART-based summarizer with multiple modes and smart features"""
-    
     def __init__(self, bart_components):
         self.pipeline = bart_components['pipeline']
         self.tokenizer = bart_components['tokenizer']
         self.model = bart_components['model']
         self.device = bart_components['device']
-        
-        # Summary presets
         self.summary_presets = {
-            'tweet': {'max_length': 50, 'min_length': 20, 'description': 'Twitter-style brief summary'},
-            'short': {'max_length': 100, 'min_length': 40, 'description': 'Short paragraph summary'},
-            'medium': {'max_length': 200, 'min_length': 80, 'description': 'Standard summary'},
-            'long': {'max_length': 400, 'min_length': 150, 'description': 'Detailed summary'},
-            'auto': {'max_length': None, 'min_length': None, 'description': 'Automatically adjusted length'}
+            'tweet': {'max_length': 50, 'min_length': 20},
+            'short': {'max_length': 100, 'min_length': 40},
+            'medium': {'max_length': 200, 'min_length': 80},
+            'long': {'max_length': 400, 'min_length': 150},
+            'auto': {'max_length': None, 'min_length': None}
         }
-    
-    def _smart_length_calculation(self, text: str) -> Dict[str, int]:
-        """Calculate optimal summary length based on input text characteristics"""
-        word_count = len(text.split())
-        
-        # Smart length calculation
-        if word_count < 100:
-            ratio = 0.7
-        elif word_count < 500:
-            ratio = 0.4
-        elif word_count < 1500:
-            ratio = 0.25
-        elif word_count < 5000:
-            ratio = 0.15
-        else:
-            ratio = 0.1
-        
-        target_words = max(30, int(word_count * ratio))
-        max_length = min(400, int(target_words * 1.3))
-        min_length = max(20, int(target_words * 0.7))
-        
+
+    def _smart_length(self, text: str) -> Dict[str, int]:
+        wc = len(text.split())
+        if wc < 100: ratio = .7
+        elif wc < 500: ratio = .4
+        elif wc < 1500: ratio = .25
+        elif wc < 5000: ratio = .15
+        else: ratio = .1
+        target = max(30, int(wc*ratio))
         return {
-            'max_length': max_length,
-            'min_length': min_length,
-            'target_words': target_words,
-            'compression_ratio': ratio
+            "max_length": min(400, int(target*1.3)),
+            "min_length": max(20, int(target*.7)),
+            "target_words": target,
+            "compression_ratio": ratio
         }
-    
+
     def _chunk_long_text(self, text: str, max_tokens: int = 900) -> List[str]:
-        """Split long text into chunks that BART can handle"""
         max_chars = max_tokens * 4
-        
         if len(text) <= max_chars:
             return [text]
-        
-        # Split by paragraphs first
-        paragraphs = text.split('\n\n')
-        chunks = []
-        current_chunk = ""
-        
-        for paragraph in paragraphs:
-            if len(current_chunk + paragraph) <= max_chars:
-                current_chunk += paragraph + "\n\n"
+        paragraphs = [p for p in text.split("\n\n") if p.strip()]
+        chunks, cur = [], ""
+        for p in paragraphs:
+            if len(cur)+len(p) <= max_chars:
+                cur += p + "\n\n"
             else:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                current_chunk = paragraph + "\n\n"
-        
-        if current_chunk:
-            chunks.append(current_chunk.strip())
-        
+                if cur: chunks.append(cur.strip())
+                cur = p + "\n\n"
+        if cur: chunks.append(cur.strip())
         return chunks
-    
-    def summarize(self, 
-                 text: str, 
-                 style: str = 'auto',
-                 custom_length: Optional[Dict] = None,
-                 extract_entities: bool = True) -> Dict:
-        """Generate summary with multiple options"""
-        start_time = time.time()
-        
-        # Prepare length parameters
-        if style == 'custom' and custom_length:
-            length_params = custom_length
-        elif style == 'auto':
-            length_params = self._smart_length_calculation(text)
+
+    def summarize_bart(self, text: str, style: str = 'auto') -> str:
+        if style == 'auto':
+            length = self._smart_length(text)
         else:
-            length_params = self.summary_presets[style].copy()
-        
-        # Handle long documents by chunking
+            length = self.summary_presets[style].copy()
         chunks = self._chunk_long_text(text)
-        chunk_summaries = []
-        
-        try:
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            for i, chunk in enumerate(chunks):
-                if len(chunk.strip()) < 50:
-                    continue
-                
-                status_text.text(f"Processing chunk {i+1}/{len(chunks)}...")
-                progress_bar.progress((i + 1) / len(chunks))
-                
-                chunk_max_length = length_params['max_length']
-                chunk_min_length = length_params['min_length']
-                
-                if len(chunks) > 1:
-                    chunk_max_length = min(200, chunk_max_length)
-                    chunk_min_length = min(chunk_min_length, chunk_max_length - 20)
-                
-                result = self.pipeline(
-                    chunk,
-                    max_length=chunk_max_length,
-                    min_length=chunk_min_length,
-                    do_sample=False,
-                    truncation=True
-                )
-                
-                chunk_summaries.append(result[0]['summary_text'])
-            
-            status_text.text("Finalizing summary...")
-            
-            # Combine chunk summaries
-            if len(chunk_summaries) > 1:
-                combined_text = " ".join(chunk_summaries)
-                
-                if len(combined_text.split()) > length_params.get('max_length', 200):
-                    final_result = self.pipeline(
-                        combined_text,
-                        max_length=length_params['max_length'],
-                        min_length=length_params['min_length'],
-                        do_sample=False,
-                        truncation=True
-                    )
-                    final_summary = final_result[0]['summary_text']
-                else:
-                    final_summary = combined_text
-            else:
-                final_summary = chunk_summaries[0] if chunk_summaries else "Unable to generate summary."
-            
-            # Clear progress indicators
-            progress_bar.empty()
-            status_text.empty()
-            
-            # Extract key entities if requested
-            entities = self._extract_entities(text) if extract_entities else {}
-            
-            # Calculate metrics
-            metrics = self._calculate_metrics(text, final_summary)
-            
-            result = {
-                'summary': final_summary,
-                'original_length': len(text),
-                'summary_length': len(final_summary),
-                'compression_ratio': len(final_summary) / len(text) if len(text) > 0 else 0,
-                'processing_time': time.time() - start_time,
-                'style_used': style,
-                'chunks_processed': len(chunks),
-                'entities': entities,
-                'metrics': metrics,
-                'length_params': length_params
-            }
-            
-        except Exception as e:
-            st.error(f"Error generating summary: {str(e)}")
-            result = {
-                'summary': f"Error generating summary: {str(e)}",
-                'error': str(e),
-                'processing_time': time.time() - start_time,
-                'original_length': len(text),
-                'summary_length': 0,
-                'compression_ratio': 0
-            }
-        
-        return result
-    
-    def _extract_entities(self, text: str) -> Dict:
-        """Extract key entities using rule-based approach"""
-        entities = {
-            'dates': [],
-            'numbers': [],
-            'proper_nouns': [],
-            'organizations': []
-        }
-        
-        # Date patterns
-        date_patterns = [
-            r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b',
-            r'\b\d{1,2}\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{2,4}\b',
-            r'\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{2,4}\b'
-        ]
-        
-        for pattern in date_patterns:
-            entities['dates'].extend(re.findall(pattern, text, re.IGNORECASE))
-        
-        # Numbers and percentages
-        number_patterns = [
-            r'\b\d+(?:,\d{3})*(?:\.\d+)?\s*%\b',
-            r'\$\d+(?:,\d{3})*(?:\.\d+)?(?:\s*(?:million|billion|trillion))?\b',
-            r'\b\d+(?:,\d{3})*(?:\.\d+)?\s*(?:million|billion|trillion)\b'
-        ]
-        
-        for pattern in number_patterns:
-            entities['numbers'].extend(re.findall(pattern, text, re.IGNORECASE))
-        
-        # Proper nouns
-        proper_nouns = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', text)
-        entities['proper_nouns'] = list(set(proper_nouns[:20]))
-        
-        return entities
-    
-    def _calculate_metrics(self, original: str, summary: str) -> Dict:
-        """Calculate quality metrics"""
-        return {
-            'word_count_original': len(original.split()),
-            'word_count_summary': len(summary.split()),
-            'sentence_count_original': len(re.split(r'[.!?]+', original)),
-            'sentence_count_summary': len(re.split(r'[.!?]+', summary)),
-            'avg_sentence_length': len(summary.split()) / max(1, len(re.split(r'[.!?]+', summary))),
-            'lexical_diversity': len(set(summary.lower().split())) / max(1, len(summary.split()))
-        }
+        outs = []
+        for i, ch in enumerate(chunks):
+            res = self.pipeline(
+                ch,
+                max_length=min(200, length['max_length']) if len(chunks)>1 else length['max_length'],
+                min_length=max(20, (length['min_length'] or 20)),
+                do_sample=False,
+                truncation=True
+            )
+            outs.append(res[0]['summary_text'])
+        final = " ".join(outs)
+        # second pass if needed
+        if len(outs) > 1 and len(final.split()) > (length['max_length'] or 200):
+            res2 = self.pipeline(
+                final,
+                max_length=length['max_length'] or 200,
+                min_length=length['min_length'] or 80,
+                do_sample=False,
+                truncation=True
+            )
+            final = res2[0]['summary_text']
+        return final
 
+# ======================================================
+#                 Extractive Baseline (TextRank)
+# ======================================================
+def textrank_summary(text: str, sentence_count: int = 5) -> str:
+    if HAS_SUMY:
+        parser = PlainTextParser.from_string(text, SumyTokenizer("english"))
+        summarizer = TextRankSummarizer()
+        sents = summarizer(parser.document, sentence_count)
+        return " ".join(str(s) for s in sents)
+    # ---- Basit yedek (sumy yoksa): en çok anahtar kelime içeren cümleleri seç ----
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    words = re.findall(r"\b\w+\b", text.lower())
+    stop = set("""the a an and or but if for to of in on at by with from this that is are was were be been being as it its it's into about over after before between among against during without within through per than then so such also can may might will would should could""".split())
+    freq = {}
+    for w in words:
+        if w not in stop and len(w) > 2:
+            freq[w] = freq.get(w, 0) + 1
+    scores = []
+    for s in sentences:
+        sw = re.findall(r"\b\w+\b", s.lower())
+        score = sum(freq.get(w,0) for w in sw if w not in stop)
+        scores.append((score, s))
+    top = [s for _, s in sorted(scores, reverse=True)[:max(1, sentence_count)]]
+    return " ".join(top)
 
-# Main Streamlit App
+# ======================================================
+#                 RAG (Simple)
+# ======================================================
+class SimpleRAG:
+    def __init__(self, embed_model="sentence-transformers/all-MiniLM-L6-v2"):
+        self.encoder = SentenceTransformer(embed_model)
+        self.index = None
+        self.passages = []
+
+    def _split(self, text: str, chunk_words=180):
+        toks = text.split()
+        chunks = [" ".join(toks[i:i+chunk_words]) for i in range(0, len(toks), chunk_words)]
+        return [c for c in chunks if len(c.split()) > 20]
+
+    def build(self, text: str):
+        self.passages = self._split(text)
+        if not self.passages:
+            self.index = None
+            return
+        embs = self.encoder.encode(self.passages, convert_to_numpy=True, normalize_embeddings=True)
+        self.index = faiss.IndexFlatIP(embs.shape[1])
+        self.index.add(embs)
+
+    def retrieve(self, query: str, k=6):
+        if self.index is None or not self.passages:
+            return []
+        q = self.encoder.encode([query], convert_to_numpy=True, normalize_embeddings=True)
+        D, I = self.index.search(q, min(k, len(self.passages)))
+        return [self.passages[i] for i in I[0] if i >= 0]
+
+# ======================================================
+#                 Factuality Verifier (NLI)
+# ======================================================
+class NLIVerifier:
+    def __init__(self, model_name="microsoft/deberta-large-mnli"):
+        self.tok = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model.to(self.device)
+
+    @torch.no_grad()
+    def score(self, premise: str, hypothesis: str) -> float:
+        batch = self.tok(premise, hypothesis, return_tensors="pt", truncation=True, max_length=512).to(self.device)
+        probs = self.model(**batch).logits.softmax(-1)[0].cpu().numpy()
+        # labels: 0: contradiction, 1: neutral, 2: entailment
+        return float(probs[2])
+
+    def verify_summary(self, source_text: str, summary_text: str, thresh: float = 0.55):
+        sents = [s.strip() for s in re.split(r'[.!?]+', summary_text) if s.strip()]
+        results = []
+        # For speed, use first 3000 chars of source; if RAG kullanılacaksa ilgili pasaj verin.
+        premise = source_text[:3000]
+        for s in sents:
+            ent = self.score(premise, s)
+            results.append({"sentence": s, "entailment": ent, "flag": ent < thresh})
+        factuality = sum(r["entailment"] for r in results) / max(1, len(results))
+        return {"per_sentence": results, "factuality_score": factuality}
+
+# ======================================================
+#                 Utility: Entities (optional UI)
+# ======================================================
+def extract_entities_rule_based(text: str) -> Dict:
+    entities = {'dates': [], 'numbers': [], 'proper_nouns': []}
+    date_patterns = [
+        r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b',
+        r'\b\d{1,2}\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{2,4}\b',
+        r'\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{2,4}\b'
+    ]
+    for p in date_patterns:
+        entities['dates'].extend(re.findall(p, text, re.IGNORECASE))
+    number_patterns = [
+        r'\b\d+(?:,\d{3})*(?:\.\d+)?\s*%\b',
+        r'\$\d+(?:,\d{3})*(?:\.\d+)?(?:\s*(?:million|billion|trillion))?\b',
+        r'\b\d+(?:,\d{3})*(?:\.\d+)?\s*(?:million|billion|trillion)\b'
+    ]
+    for p in number_patterns:
+        entities['numbers'].extend(re.findall(p, text, re.IGNORECASE))
+    proper_nouns = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', text)
+    entities['proper_nouns'] = list(dict.fromkeys(proper_nouns))[:20]
+    return entities
+
+# ======================================================
+#                 Metrics
+# ======================================================
+def compute_rouge(ref: str, hyp: str) -> Dict[str, float]:
+    rs = rouge_scorer.RougeScorer(["rouge1","rouge2","rougeL"], use_stemmer=True)
+    sc = rs.score(ref, hyp)
+    return {k: v.fmeasure for k, v in sc.items()}
+
+def compute_bertscore(ref: str, hyp: str) -> float:
+    P, R, F = bertscore([hyp], [ref], lang="en")
+    return float(F.mean())
+
+# ======================================================
+#                 Main App
+# ======================================================
 def main():
-    st.title("🚀 Universal BART Document Summarizer")
-    st.markdown("*AI-powered summarization using facebook/bart-large-cnn*")
-    
-    # Initialize session state
-    if 'bart_model' not in st.session_state:
-        with st.spinner("🤖 Loading Full BART Model... (this will take 2-3 minutes first time)"):
-            st.session_state.bart_model = load_bart_model()
-            st.session_state.summarizer = SmartBARTSummarizer(st.session_state.bart_model)
-            st.session_state.processor = UniversalDocumentProcessor()
-    
-    # Sidebar configuration
+    st.title("🚀 Universal Document Summarizer (Advanced)")
+    st.markdown("**Models:** facebook/bart-large-cnn · DeBERTa MNLI · MiniLM RAG | **Features:** RAG, factuality, baselines, evaluation")
+
+    # session init
+    if "processor" not in st.session_state:
+        st.session_state.processor = UniversalDocumentProcessor()
+    if "bart" not in st.session_state:
+        with st.spinner("Loading BART model..."):
+            st.session_state.bart = load_bart_model()
+            st.session_state.summarizer = SmartBARTSummarizer(st.session_state.bart)
+    if "verifier" not in st.session_state:
+        st.session_state.verifier = NLIVerifier()
+    if "rag" not in st.session_state:
+        st.session_state.rag = SimpleRAG()
+
+    # Sidebar
     st.sidebar.header("⚙️ Configuration")
-    
-    summary_style = st.sidebar.selectbox(
-        "Summary Style",
-        ['auto', 'tweet', 'short', 'medium', 'long'],
-        help="Choose the length and style of summary"
+    method = st.sidebar.selectbox(
+        "Method",
+        ["BART (baseline)", "Extractive (TextRank)", "RAG + BART", "BART + Verifier", "RAG + BART + Verifier"]
     )
-    
-    extract_entities = st.sidebar.checkbox("Extract Key Entities", value=True)
-    
-    # Model info in sidebar
+    summary_style = st.sidebar.selectbox("Summary Style", ['auto', 'tweet', 'short', 'medium', 'long'])
+    show_entities = st.sidebar.checkbox("Show key entities (rule-based)", value=False,
+                                        help="Sadece görsel destek; değerlendirme metoduna dahil değil.")
     st.sidebar.markdown("---")
-    st.sidebar.markdown("**🤖 Model Info**")
-    st.sidebar.write(f"Model: facebook/bart-large-cnn")
-    st.sidebar.write(f"Device: {st.session_state.bart_model['device']}")
-    
-    # Main interface tabs
-    tab1, tab2, tab3 = st.tabs(["📄 Summarize", "📊 Batch Process", "🎯 Test Examples"])
-    
+    st.sidebar.write(f"**Model:** facebook/bart-large-cnn")
+    st.sidebar.write(f"**Device:** {st.session_state.bart['device']}")
+
+    tab1, tab2, tab3, tab4 = st.tabs(["📄 Summarize", "📊 Batch", "🧪 Evaluate (with reference)", "🎯 Test Examples"])
+
+    # ---------- Tab 1: Summarize ----------
     with tab1:
         st.header("Document Summarization")
-        
-        # Input method selection
-        input_method = st.radio(
-            "Choose input method:",
-            ["Upload File", "Paste Text", "URL"]
-        )
-        
+        input_method = st.radio("Choose input method:", ["Upload File", "Paste Text", "URL"], horizontal=True)
         document_text = ""
-        
+
         if input_method == "Upload File":
-            uploaded_file = st.file_uploader(
-                "Choose a file",
-                type=['txt', 'pdf', 'docx', 'md'],
-                help="Supported formats: TXT, PDF, DOCX, MD"
-            )
-            
-            if uploaded_file is not None:
-                # Process document based on file type
-                file_extension = uploaded_file.name.lower().split('.')[-1]
-                
-                if file_extension == 'pdf':
-                    document_text = st.session_state.processor.read_pdf_file(uploaded_file.getvalue())
-                elif file_extension == 'docx':
-                    document_text = st.session_state.processor.read_docx_file(uploaded_file.getvalue())
-                else:  # txt, md
-                    document_text = st.session_state.processor.read_text_file(uploaded_file.getvalue())
-                
+            up = st.file_uploader("Choose a file", type=['txt','pdf','docx','md'])
+            if up is not None:
+                ext = up.name.lower().split('.')[-1]
+                if ext == 'pdf':
+                    document_text = st.session_state.processor.read_pdf_file(up.getvalue())
+                elif ext == 'docx':
+                    document_text = st.session_state.processor.read_docx_file(up.getvalue())
+                else:
+                    document_text = st.session_state.processor.read_text_file(up.getvalue())
                 if document_text:
-                    # Show document info
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("Characters", f"{len(document_text):,}")
-                    with col2:
-                        st.metric("Words", f"{len(document_text.split()):,}")
-                    with col3:
-                        st.metric("File Size", f"{len(uploaded_file.getvalue()):,} bytes")
-                    
-                    # Show preview
-                    with st.expander("Preview Document"):
-                        st.text_area("Document Preview", document_text[:1000] + "..." if len(document_text) > 1000 else document_text, height=200)
-        
+                    c1,c2,c3 = st.columns(3)
+                    with c1: st.metric("Characters", f"{len(document_text):,}")
+                    with c2: st.metric("Words", f"{len(document_text.split()):,}")
+                    with c3: st.metric("File Size", f"{len(up.getvalue()):,} B")
+                    with st.expander("Preview"):
+                        st.text_area("Document", document_text[:1000] + ("..." if len(document_text)>1000 else ""), height=200)
+
         elif input_method == "Paste Text":
-            document_text = st.text_area(
-                "Paste your text here:",
-                height=300,
-                help="Copy and paste any text you want to summarize"
-            )
-        
-        elif input_method == "URL":
-            url = st.text_input(
-                "Enter URL:",
-                placeholder="https://example.com/article"
-            )
-            
-            if url and st.button("Extract Text from URL"):
+            document_text = st.text_area("Paste text here:", height=300)
+
+        else:  # URL
+            url = st.text_input("Enter URL:", placeholder="https://example.com/article")
+            if url and st.button("Extract"):
                 with st.spinner("Extracting text from URL..."):
                     document_text = st.session_state.processor.read_url(url)
-                    
                 if document_text:
-                    st.success(f"Extracted {len(document_text.split())} words from URL")
+                    st.success(f"Extracted {len(document_text.split())} words.")
                     with st.expander("Preview Extracted Text"):
-                        st.text_area("Extracted Text", document_text[:1000] + "..." if len(document_text) > 1000 else document_text, height=200)
-                else:
-                    st.error("Failed to extract text from URL")
-        
-        # Generate summary
+                        st.text_area("Text", document_text[:1200] + ("..." if len(document_text)>1200 else ""), height=200)
+
         if document_text and st.button("🎯 Generate Summary", type="primary"):
-            summary_result = st.session_state.summarizer.summarize(
-                document_text,
-                style=summary_style,
-                extract_entities=extract_entities
-            )
-            
-            # Display results
+            t0 = time.time()
+            final_summary = ""
+            used_passages = None
+
+            # --- RAG build if needed ---
+            if "RAG" in method:
+                st.session_state.rag.build(document_text)
+                used_passages = st.session_state.rag.retrieve(document_text[:200], k=8)
+                rag_context = " ".join(used_passages) if used_passages else document_text
+                final_summary = st.session_state.summarizer.summarize_bart(rag_context, style=summary_style)
+            elif method == "Extractive (TextRank)":
+                sent_count = max(3, int(len(document_text.split())/120))
+                final_summary = textrank_summary(document_text, sentence_count=sent_count)
+            else:  # plain BART
+                final_summary = st.session_state.summarizer.summarize_bart(document_text, style=summary_style)
+
+            # --- Verifier if selected ---
+            ver_result = None
+            if "Verifier" in method:
+                premise = (" ".join(used_passages) if used_passages else document_text)[:3000]
+                ver_result = st.session_state.verifier.verify_summary(premise, final_summary)
+            proc_time = time.time() - t0
+
+            # --- Display ---
             st.subheader("📝 Summary")
-            st.write(summary_result['summary'])
-            
-            # Metrics
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Compression Ratio", f"{summary_result['compression_ratio']:.1%}")
-            with col2:
-                st.metric("Processing Time", f"{summary_result['processing_time']:.2f}s")
-            with col3:
-                st.metric("Original Words", f"{len(document_text.split()):,}")
-            with col4:
-                st.metric("Summary Words", f"{len(summary_result['summary'].split()):,}")
-            
-            # Entities
-            if extract_entities and summary_result.get('entities'):
-                st.subheader("🏷️ Key Entities")
-                entities = summary_result['entities']
-                
+            st.write(final_summary)
+
+            c1,c2,c3,c4 = st.columns(4)
+            with c1: st.metric("Time", f"{proc_time:.2f}s")
+            with c2: st.metric("Original Words", f"{len(document_text.split()):,}")
+            with c3: st.metric("Summary Words", f"{len(final_summary.split()):,}")
+            with c4:
+                cr = len(final_summary.split())/max(1,len(document_text.split()))
+                st.metric("Compression (words)", f"{cr:.1%}")
+
+            if show_entities:
+                ents = extract_entities_rule_based(document_text)
+                st.subheader("🏷️ Key Entities (rule-based)")
                 col1, col2 = st.columns(2)
                 with col1:
-                    if entities['dates']:
-                        st.write("**Dates:**", ", ".join(entities['dates'][:5]))
-                    if entities['numbers']:
-                        st.write("**Numbers:**", ", ".join(entities['numbers'][:5]))
+                    if ents['dates']: st.write("**Dates:**", ", ".join(map(str, ents['dates'][:5])))
+                    if ents['numbers']: st.write("**Numbers:**", ", ".join(map(str, ents['numbers'][:5])))
                 with col2:
-                    if entities['proper_nouns']:
-                        st.write("**Names:**", ", ".join(entities['proper_nouns'][:10]))
-            
-            # Download options
+                    if ents['proper_nouns']: st.write("**Names:**", ", ".join(ents['proper_nouns'][:10]))
+
+            if ver_result:
+                st.subheader("🔎 Factuality Check (NLI)")
+                st.metric("Avg Entailment", f"{ver_result['factuality_score']:.2f}")
+                low = [r for r in ver_result["per_sentence"] if r["flag"]]
+                if low:
+                    st.warning("Low-confidence sentences:")
+                    for r in low[:5]:
+                        st.write(f"• {r['sentence']}  _(entailment={r['entailment']:.2f})_")
+
+            # Download
             st.subheader("💾 Download")
             col1, col2 = st.columns(2)
             with col1:
-                st.download_button(
-                    "Download Summary (TXT)",
-                    summary_result['summary'],
-                    file_name="summary.txt",
-                    mime="text/plain"
-                )
+                st.download_button("Summary (TXT)", final_summary, file_name="summary.txt", mime="text/plain")
             with col2:
                 report = f"""SUMMARY REPORT
 =============
-Original Length: {summary_result['original_length']} characters
-Summary Length: {summary_result['summary_length']} characters
-Compression Ratio: {summary_result['compression_ratio']:.1%}
-Processing Time: {summary_result['processing_time']:.2f}s
-Style Used: {summary_result['style_used']}
+Original words: {len(document_text.split())}
+Summary words : {len(final_summary.split())}
+Compression   : {len(final_summary.split())/max(1,len(document_text.split())):.1%}
+Method        : {method}
+Time          : {proc_time:.2f}s
 
 SUMMARY:
-{summary_result['summary']}
+{final_summary}
 """
-                st.download_button(
-                    "Download Full Report",
-                    report,
-                    file_name="summary_report.txt",
-                    mime="text/plain"
-                )
-    
+                st.download_button("Full Report", report, file_name="summary_report.txt", mime="text/plain")
+
+    # ---------- Tab 2: Batch ----------
     with tab2:
         st.header("📊 Batch Processing")
-        st.write("Upload multiple files for batch summarization")
-        
-        uploaded_files = st.file_uploader(
-            "Choose multiple files",
-            type=['txt', 'pdf', 'docx'],
-            accept_multiple_files=True
-        )
-        
-        if uploaded_files and st.button("Process All Files"):
-            results = []
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            for i, uploaded_file in enumerate(uploaded_files):
-                status_text.text(f"Processing {uploaded_file.name}...")
-                
-                # Extract text based on file type
-                file_extension = uploaded_file.name.lower().split('.')[-1]
-                
-                if file_extension == 'pdf':
-                    text = st.session_state.processor.read_pdf_file(uploaded_file.getvalue())
-                elif file_extension == 'docx':
-                    text = st.session_state.processor.read_docx_file(uploaded_file.getvalue())
+        files = st.file_uploader("Choose multiple files", type=['txt','pdf','docx'], accept_multiple_files=True)
+        if files and st.button("Process All Files"):
+            rows = []
+            pbar = st.progress(0)
+            for i, up in enumerate(files):
+                ext = up.name.lower().split('.')[-1]
+                if ext == 'pdf':
+                    text = st.session_state.processor.read_pdf_file(up.getvalue())
+                elif ext == 'docx':
+                    text = st.session_state.processor.read_docx_file(up.getvalue())
                 else:
-                    text = st.session_state.processor.read_text_file(uploaded_file.getvalue())
-                
-                if text:
-                    # Generate summary
-                    result = st.session_state.summarizer.summarize(text, summary_style, extract_entities=False)
-                    results.append({
-                        'filename': uploaded_file.name,
-                        'original_words': len(text.split()),
-                        'summary_words': len(result['summary'].split()),
-                        'compression': f"{result['compression_ratio']:.1%}",
-                        'processing_time': f"{result['processing_time']:.2f}s",
-                        'summary': result['summary']
-                    })
-                
-                progress_bar.progress((i + 1) / len(uploaded_files))
-            
-            status_text.text("Complete!")
-            st.success(f"Processed {len(results)} documents")
-            
-            # Display results table
-            df = pd.DataFrame([{k: v for k, v in r.items() if k != 'summary'} for r in results])
+                    text = st.session_state.processor.read_text_file(up.getvalue())
+                if not text:
+                    continue
+                t0 = time.time()
+                if "RAG" in method:
+                    st.session_state.rag.build(text)
+                    ctx = " ".join(st.session_state.rag.retrieve(text[:200], k=8)) or text
+                    summary = st.session_state.summarizer.summarize_bart(ctx, style=summary_style)
+                elif method == "Extractive (TextRank)":
+                    sc = max(3, int(len(text.split())/120))
+                    summary = textrank_summary(text, sentence_count=sc)
+                else:
+                    summary = st.session_state.summarizer.summarize_bart(text, style=summary_style)
+                dt = time.time() - t0
+                rows.append({
+                    "filename": up.name,
+                    "orig_words": len(text.split()),
+                    "sum_words": len(summary.split()),
+                    "compression": f"{len(summary.split())/max(1,len(text.split())):.1%}",
+                    "time": f"{dt:.2f}s",
+                    "summary": summary
+                })
+                pbar.progress((i+1)/len(files))
+            st.success(f"Processed {len(rows)} documents")
+            df = pd.DataFrame([{k:v for k,v in r.items() if k!='summary'} for r in rows])
             st.dataframe(df, use_container_width=True)
-            
-            # Show individual summaries
-            for result in results:
-                with st.expander(f"Summary: {result['filename']}"):
-                    st.write(result['summary'])
-    
+            for r in rows:
+                with st.expander(f"Summary: {r['filename']}"):
+                    st.write(r["summary"])
+
+    # ---------- Tab 3: Evaluate (with reference) ----------
     with tab3:
+        st.header("🧪 Evaluate with reference summary")
+        st.write("Metni ve **referans özeti** girin; ROUGE, BERTScore ve (isteğe bağlı) factuality hesaplanır.")
+        src = st.text_area("Source text", height=200, key="eval_src")
+        ref = st.text_area("Reference summary", height=120, key="eval_ref")
+        use_verifier = st.checkbox("Also compute factuality (NLI on produced summary vs source)", value=True)
+        if st.button("Run Evaluation") and src and ref:
+            # Produce summary with current method
+            if "RAG" in method:
+                st.session_state.rag.build(src)
+                ctx = " ".join(st.session_state.rag.retrieve(src[:200], k=8)) or src
+                hyp = st.session_state.summarizer.summarize_bart(ctx, style=summary_style)
+            elif method == "Extractive (TextRank)":
+                sc = max(3, int(len(src.split())/120))
+                hyp = textrank_summary(src, sentence_count=sc)
+            else:
+                hyp = st.session_state.summarizer.summarize_bart(src, style=summary_style)
+
+            rdict = compute_rouge(ref, hyp)
+            bsf1 = compute_bertscore(ref, hyp)
+            st.subheader("Metrics")
+            c1,c2,c3,c4 = st.columns(4)
+            with c1: st.metric("ROUGE-1 F1", f"{rdict['rouge1']:.3f}")
+            with c2: st.metric("ROUGE-2 F1", f"{rdict['rouge2']:.3f}")
+            with c3: st.metric("ROUGE-L F1", f"{rdict['rougeL']:.3f}")
+            with c4: st.metric("BERTScore F1", f"{bsf1:.3f}")
+
+            if use_verifier:
+                ver = st.session_state.verifier.verify_summary(src[:3000], hyp)
+                st.metric("Factuality (avg entailment)", f"{ver['factuality_score']:.2f}")
+            with st.expander("Produced Summary"):
+                st.write(hyp)
+
+    # ---------- Tab 4: Examples ----------
+    with tab4:
         st.header("🎯 Test Examples")
-        st.write("Try the summarizer with pre-loaded examples")
-        
+
         examples = {
-            "News Article": """
-            Scientists have made a groundbreaking discovery that could revolutionize the treatment of Alzheimer's disease. 
-            Researchers at Stanford University have identified a new protein that appears to protect brain cells from the 
-            damage associated with this neurodegenerative condition. The study, published in Nature Medicine, shows that 
-            patients with higher levels of this protein, called neuroprotectin-1, show significantly slower cognitive 
-            decline over a five-year period. The research team tested the protein in laboratory mice and found that it 
-            could reverse memory loss and reduce brain inflammation. Clinical trials in humans are expected to begin 
-            within the next two years, offering hope to millions of families affected by Alzheimer's disease.
-            """,
-            "Technical Document": """
-            Machine learning algorithms have become increasingly sophisticated in recent years, with deep learning 
-            representing a significant advancement in artificial intelligence. Neural networks, inspired by the structure 
-            of the human brain, consist of interconnected nodes that process information in layers. These systems excel 
-            at pattern recognition tasks, such as image classification and natural language processing. The training 
-            process involves feeding large datasets to the network, allowing it to learn complex relationships between 
-            inputs and outputs. Convolutional neural networks are particularly effective for image analysis, while 
-            recurrent neural networks are well-suited for sequential data like text and speech.
-            """,
-            "Business Report": """
-            The quarterly earnings report shows strong performance across all major business segments. Revenue increased 
-            by 15% year-over-year to $2.8 billion, exceeding analyst expectations of $2.6 billion. The cloud computing 
-            division was the strongest performer, growing 28% and contributing $890 million to total revenue. Operating 
-            margins improved to 22%, up from 19% in the previous quarter, due to operational efficiencies and cost 
-            reduction initiatives. The company raised its full-year guidance, now expecting revenue growth of 12-14% 
-            and earnings per share of $4.20-$4.40. Management remains optimistic about the outlook for the remainder 
-            of the fiscal year.
-            """
+            "News Article": (
+                "Scientists have reported a promising breakthrough that could change how Alzheimer's disease is treated. "
+                "A multi-institution team led by Stanford University identified a protein, neuroprotectin-1, that appears to "
+                "shield neurons from amyloid-related toxicity. In a five-year observational study of 1,842 people, higher "
+                "baseline levels of the protein correlated with a significantly slower rate of cognitive decline. In mouse "
+                "models, weekly injections restored memory performance on maze tasks and reduced neuroinflammation markers by "
+                "38% after eight weeks. The authors caution that the mechanism is not fully understood and that long-term "
+                "safety data are missing. A Phase I clinical trial to test tolerability is planned for early next year."
+            ),
+            "Technical Document": (
+                "Deep learning systems are trained by minimizing a loss function L(θ) over large datasets using stochastic "
+                "gradient descent. Convolutional neural networks (CNNs) use weight sharing and local connectivity to model "
+                "spatial structure and reduce parameters, enabling translation invariance. Vision Transformers (ViT) treat "
+                "images as sequences of patches and rely on self-attention to capture long-range dependencies. In NLP, "
+                "encoder–decoder architectures such as BART perform denoising pretraining and are fine-tuned for tasks like "
+                "summarization. Regularization techniques include dropout, label smoothing, and data augmentation, while "
+                "evaluation commonly reports accuracy, F1, BLEU, or ROUGE depending on the task."
+            ),
+            "Business Report": (
+                "The company posted strong Q2 results across all segments. Revenue rose 15% year-over-year to $2.8B, beating "
+                "consensus by $200M. Cloud grew 28% to $890M as new enterprise customers onboarded ahead of schedule. "
+                "Operating margin improved to 22% (vs. 19% in Q1) due to supply-chain efficiencies and a shift toward higher-"
+                "margin software. Free cash flow reached $310M, up 24% YoY, and the board authorized a $250M buyback. "
+                "Management raised full-year guidance to 12–14% revenue growth and EPS of $4.20–$4.40, citing a robust "
+                "pipeline but warning of FX headwinds in EMEA. The outlook assumes no major macro shocks in H2."
+            )
         }
-        
-        selected_example = st.selectbox("Choose an example:", list(examples.keys()))
-        
+
+        ex = st.selectbox("Choose example:", list(examples.keys()))
         if st.button("Load Example"):
-            st.session_state.example_text = examples[selected_example]
-        
+            st.session_state.example_text = examples[ex]
+
         if hasattr(st.session_state, 'example_text'):
-            st.text_area("Example Text:", st.session_state.example_text, height=200)
-            
+            st.text_area("Example Text:", st.session_state.example_text, height=220)
+
             if st.button("Summarize Example"):
-                result = st.session_state.summarizer.summarize(
-                    st.session_state.example_text,
-                    style=summary_style,
-                    extract_entities=extract_entities
-                )
-                
-                st.subheader("Summary:")
-                st.write(result['summary'])
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Compression", f"{result['compression_ratio']:.1%}")
-                with col2:
-                    st.metric("Time", f"{result['processing_time']:.2f}s")
-                with col3:
-                    st.metric("Words", f"{len(result['summary'].split())}")
+                t0 = time.time()
+                # --- summarize according to method ---
+                if "RAG" in method:
+                    st.session_state.rag.build(st.session_state.example_text)
+                    ctx = " ".join(
+                        st.session_state.rag.retrieve(st.session_state.example_text[:200], k=6)
+                    ) or st.session_state.example_text
+                    out = st.session_state.summarizer.summarize_bart(ctx, style=summary_style)
+                elif method == "Extractive (TextRank)":
+                    sc = max(3, int(len(st.session_state.example_text.split())/120))
+                    out = textrank_summary(st.session_state.example_text, sentence_count=sc)
+                else:
+                    out = st.session_state.summarizer.summarize_bart(
+                        st.session_state.example_text, style=summary_style
+                    )
+                dt = time.time() - t0
+
+                # --- result and metrics---
+                st.subheader("Summary")
+                st.write(out)
+
+                orig_words = len(st.session_state.example_text.split())
+                sum_words  = len(out.split())
+                compression = sum_words / max(1, orig_words)
+
+                c1, c2, c3 = st.columns(3)
+                with c1: st.metric("Compression (words)", f"{compression:.1%}")
+                with c2: st.metric("Time", f"{dt:.2f}s")
+                with c3: st.metric("Summary Words", f"{sum_words:,}")
 
 
 if __name__ == "__main__":
+    torch.manual_seed(42)
+    np.random.seed(42)
     main()
