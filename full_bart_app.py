@@ -335,14 +335,27 @@ def main():
     if "verifier" not in st.session_state:
         st.session_state.verifier = NLIVerifier()
     if "rag" not in st.session_state:
-        st.session_state.rag = SimpleRAG()
+        if HAS_ST:
+            try:
+                st.session_state.rag = SimpleRAG()
+            except Exception as e:
+                st.warning(f"Could not initialize RAG: {e}. RAG features will be disabled.")
+                st.session_state.rag = None
+        else:
+            st.warning("sentence-transformers not installed. RAG features disabled.")
+            st.session_state.rag = None
 
     # Sidebar
-    st.sidebar.header("⚙️ Configuration")
-    method = st.sidebar.selectbox(
-        "Method",
-        ["BART (baseline)", "Extractive (TextRank)", "RAG + BART", "BART + Verifier", "RAG + BART + Verifier"]
-    )
+    st.sidebar.header(" Configuration")
+    
+    # Adjust available methods based on RAG availability
+    available_methods = ["BART (baseline)", "Extractive (TextRank)", "BART + Verifier"]
+    if st.session_state.rag is not None:
+        available_methods.extend(["RAG + BART", "RAG + BART + Verifier"])
+    else:
+        st.sidebar.warning(" RAG methods disabled (install sentence-transformers & faiss-cpu)")
+    
+    method = st.sidebar.selectbox("Method", available_methods)
     summary_style = st.sidebar.selectbox("Summary Style", ['auto', 'tweet', 'short', 'medium', 'long'])
     show_entities = st.sidebar.checkbox("Show key entities (rule-based)", value=False,
                                         help="Sadece görsel destek; değerlendirme metoduna dahil değil.")
@@ -396,10 +409,14 @@ def main():
 
             # --- RAG build if needed ---
             if "RAG" in method:
-                st.session_state.rag.build(document_text)
-                used_passages = st.session_state.rag.retrieve(document_text[:200], k=8)
-                rag_context = " ".join(used_passages) if used_passages else document_text
-                final_summary = st.session_state.summarizer.summarize_bart(rag_context, style=summary_style)
+                if st.session_state.rag is not None:
+                    st.session_state.rag.build(document_text)
+                    used_passages = st.session_state.rag.retrieve(document_text[:200], k=8)
+                    rag_context = " ".join(used_passages) if used_passages else document_text
+                    final_summary = st.session_state.summarizer.summarize_bart(rag_context, style=summary_style)
+                else:
+                    st.error("RAG is not available. Please install sentence-transformers and faiss-cpu.")
+                    final_summary = st.session_state.summarizer.summarize_bart(document_text, style=summary_style)
             elif method == "Extractive (TextRank)":
                 sent_count = max(3, int(len(document_text.split())/120))
                 final_summary = textrank_summary(document_text, sentence_count=sent_count)
@@ -482,9 +499,12 @@ SUMMARY:
                     continue
                 t0 = time.time()
                 if "RAG" in method:
-                    st.session_state.rag.build(text)
-                    ctx = " ".join(st.session_state.rag.retrieve(text[:200], k=8)) or text
-                    summary = st.session_state.summarizer.summarize_bart(ctx, style=summary_style)
+                    if st.session_state.rag is not None:
+                        st.session_state.rag.build(text)
+                        ctx = " ".join(st.session_state.rag.retrieve(text[:200], k=8)) or text
+                        summary = st.session_state.summarizer.summarize_bart(ctx, style=summary_style)
+                    else:
+                        summary = st.session_state.summarizer.summarize_bart(text, style=summary_style)
                 elif method == "Extractive (TextRank)":
                     sc = max(3, int(len(text.split())/120))
                     summary = textrank_summary(text, sentence_count=sc)
@@ -510,16 +530,19 @@ SUMMARY:
     # ---------- Tab 3: Evaluate (with reference) ----------
     with tab3:
         st.header("🧪 Evaluate with reference summary")
-        st.write("Metni ve **referans özeti** girin; ROUGE, BERTScore ve (isteğe bağlı) factuality hesaplanır.")
+        st.write("Enter the text and reference summary ; ROUGE, BERTScore, and (optional) factuality are calculated.")
         src = st.text_area("Source text", height=200, key="eval_src")
         ref = st.text_area("Reference summary", height=120, key="eval_ref")
         use_verifier = st.checkbox("Also compute factuality (NLI on produced summary vs source)", value=True)
         if st.button("Run Evaluation") and src and ref:
             # Produce summary with current method
             if "RAG" in method:
-                st.session_state.rag.build(src)
-                ctx = " ".join(st.session_state.rag.retrieve(src[:200], k=8)) or src
-                hyp = st.session_state.summarizer.summarize_bart(ctx, style=summary_style)
+                if st.session_state.rag is not None:
+                    st.session_state.rag.build(src)
+                    ctx = " ".join(st.session_state.rag.retrieve(src[:200], k=8)) or src
+                    hyp = st.session_state.summarizer.summarize_bart(ctx, style=summary_style)
+                else:
+                    hyp = st.session_state.summarizer.summarize_bart(src, style=summary_style)
             elif method == "Extractive (TextRank)":
                 sc = max(3, int(len(src.split())/120))
                 hyp = textrank_summary(src, sentence_count=sc)
@@ -585,11 +608,14 @@ SUMMARY:
                 t0 = time.time()
                 # --- summarize according to method ---
                 if "RAG" in method:
-                    st.session_state.rag.build(st.session_state.example_text)
-                    ctx = " ".join(
-                        st.session_state.rag.retrieve(st.session_state.example_text[:200], k=6)
-                    ) or st.session_state.example_text
-                    out = st.session_state.summarizer.summarize_bart(ctx, style=summary_style)
+                    if st.session_state.rag is not None:
+                        st.session_state.rag.build(st.session_state.example_text)
+                        ctx = " ".join(
+                            st.session_state.rag.retrieve(st.session_state.example_text[:200], k=6)
+                        ) or st.session_state.example_text
+                        out = st.session_state.summarizer.summarize_bart(ctx, style=summary_style)
+                    else:
+                        out = st.session_state.summarizer.summarize_bart(st.session_state.example_text, style=summary_style)
                 elif method == "Extractive (TextRank)":
                     sc = max(3, int(len(st.session_state.example_text.split())/120))
                     out = textrank_summary(st.session_state.example_text, sentence_count=sc)
